@@ -35,6 +35,19 @@ import com.google.api.services.admin.directory.model.Groups;
 import com.netflix.spinnaker.fiat.model.resources.Role;
 import com.netflix.spinnaker.fiat.permissions.ExternalUser;
 import com.netflix.spinnaker.fiat.roles.UserRolesProvider;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.Setter;
@@ -50,25 +63,12 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.stereotype.Component;
 import org.springframework.util.Assert;
 
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
-
 @Slf4j
 @Component
-@ConditionalOnProperty(value = "auth.groupMembership.service", havingValue = "google")
+@ConditionalOnProperty(value = "auth.group-membership.service", havingValue = "google")
 public class GoogleDirectoryUserRolesProvider implements UserRolesProvider, InitializingBean {
 
-  @Autowired
-  @Setter
-  private Config config;
+  @Autowired @Setter private Config config;
 
   private static final Collection<String> SERVICE_ACCOUNT_SCOPES =
       Collections.singleton(DirectoryScopes.ADMIN_DIRECTORY_GROUP_READONLY);
@@ -99,10 +99,8 @@ public class GoogleDirectoryUserRolesProvider implements UserRolesProvider, Init
         return;
       }
 
-      Set<Role> groupSet = groups.getGroups()
-                                 .stream()
-                                 .map(GoogleDirectoryUserRolesProvider::toRole)
-                                 .collect(Collectors.toSet());
+      Set<Role> groupSet =
+          groups.getGroups().stream().flatMap(toRoleFn()).collect(Collectors.toSet());
       emailGroupsMap.put(email, groupSet);
     }
   }
@@ -113,32 +111,38 @@ public class GoogleDirectoryUserRolesProvider implements UserRolesProvider, Init
       return new HashMap<>();
     }
 
-    Collection<String> userEmails = users.stream().map(ExternalUser::getId).collect(Collectors.toList());
+    Collection<String> userEmails =
+        users.stream().map(ExternalUser::getId).collect(Collectors.toList());
     HashMap<String, Collection<Role>> emailGroupsMap = new HashMap<>();
     Directory service = getDirectoryService();
     BatchRequest batch = service.batch();
-    userEmails.forEach(email -> {
-      try {
-        GroupBatchCallback callback = new GroupBatchCallback().setEmailGroupsMap(emailGroupsMap)
-                                                              .setEmail(email);
-        HttpRequest request = service.groups()
-               .list()
-               .setDomain(config.getDomain())
-               .setUserKey(email)
-               .buildHttpRequest();
-        HttpBackOffUnsuccessfulResponseHandler handler = new HttpBackOffUnsuccessfulResponseHandler(new ExponentialBackOff());
-        handler.setBackOffRequired(response -> {
-          int code = response.getStatusCode();
-          // 403 is Google's Rate limit exceeded response.
-          return code == 403 || code / 100 == 5;
-        });
-        request.setUnsuccessfulResponseHandler(handler);
-        batch.queue(request, Groups.class, GoogleJsonErrorContainer.class, callback);
+    userEmails.forEach(
+        email -> {
+          try {
+            GroupBatchCallback callback =
+                new GroupBatchCallback().setEmailGroupsMap(emailGroupsMap).setEmail(email);
+            HttpRequest request =
+                service
+                    .groups()
+                    .list()
+                    .setDomain(config.getDomain())
+                    .setUserKey(email)
+                    .buildHttpRequest();
+            HttpBackOffUnsuccessfulResponseHandler handler =
+                new HttpBackOffUnsuccessfulResponseHandler(new ExponentialBackOff());
+            handler.setBackOffRequired(
+                response -> {
+                  int code = response.getStatusCode();
+                  // 403 is Google's Rate limit exceeded response.
+                  return code == 403 || code / 100 == 5;
+                });
+            request.setUnsuccessfulResponseHandler(handler);
+            batch.queue(request, Groups.class, GoogleJsonErrorContainer.class, callback);
 
-      } catch (IOException ioe) {
-        throw new RuntimeException(ioe);
-      }
-    });
+          } catch (IOException ioe) {
+            throw new RuntimeException(ioe);
+          }
+        });
 
     try {
       batch.execute();
@@ -156,22 +160,22 @@ public class GoogleDirectoryUserRolesProvider implements UserRolesProvider, Init
     }
 
     String userEmail = user.getId();
-    Directory service = getDirectoryService();
 
     try {
-      Groups groups = service.groups().list().setDomain(config.getDomain()).setUserKey(userEmail).execute();
+      Groups groups = getGroupsFromEmail(userEmail);
       if (groups == null || groups.getGroups() == null || groups.getGroups().isEmpty()) {
         return new ArrayList<>();
       }
 
-      return groups
-          .getGroups()
-          .stream()
-          .map(GoogleDirectoryUserRolesProvider::toRole)
-          .collect(Collectors.toList());
+      return groups.getGroups().stream().flatMap(toRoleFn()).collect(Collectors.toList());
     } catch (IOException ioe) {
       throw new RuntimeException(ioe);
     }
+  }
+
+  protected Groups getGroupsFromEmail(String email) throws IOException {
+    Directory service = getDirectoryService();
+    return service.groups().list().setDomain(config.getDomain()).setUserKey(email).execute();
   }
 
   private GoogleCredential getGoogleCredential() {
@@ -200,28 +204,51 @@ public class GoogleDirectoryUserRolesProvider implements UserRolesProvider, Init
         .build();
   }
 
-  private static Role toRole(Group g) {
-    return new Role().setName(g.getName().toLowerCase()).setSource(Role.Source.GOOGLE_GROUPS);
+  private static Role toRole(Group g, Config.RoleSource src) {
+    if (src == Config.RoleSource.EMAIL) {
+      if (g.getEmail() == null) {
+        return null;
+      }
+      return new Role().setName(g.getEmail().toLowerCase()).setSource(Role.Source.GOOGLE_GROUPS);
+    } else if (src == Config.RoleSource.NAME) {
+      if (g.getName() == null) {
+        return null;
+      }
+      return new Role().setName(g.getName().toLowerCase()).setSource(Role.Source.GOOGLE_GROUPS);
+    } else {
+      throw new RuntimeException("Unexpected Google role source: " + src);
+    }
+  }
+
+  private Function<Group, Stream<Role>> toRoleFn() {
+    return (g) ->
+        Arrays.stream(config.roleSources).map((r) -> GoogleDirectoryUserRolesProvider.toRole(g, r));
   }
 
   @Data
   @Configuration
-  @ConfigurationProperties("auth.groupMembership.google")
+  @ConfigurationProperties("auth.group-membership.google")
   public static class Config {
 
-    /**
-     * Path to json credential file for the groups service account.
-     */
+    /** Path to json credential file for the groups service account. */
     private String credentialPath;
 
-    /**
-     * Email of the Google Apps admin the service account is acting on behalf of.
-     */
+    /** Email of the Google Apps admin the service account is acting on behalf of. */
     private String adminUsername;
 
-    /**
-     * Google Apps for Work domain, e.g. netflix.com
-     */
+    /** Google Apps for Work domain, e.g. netflix.com */
     private String domain;
+
+    /**
+     * List of sources to derive role name from group metadata, this setting is additive to allow
+     * backwards compatibility
+     */
+    private RoleSource[] roleSources = new RoleSource[] {Config.RoleSource.NAME};
+
+    /** RoleSource maps to metadata on the Group metadata, NAME = Group Name, Email = Group Email */
+    private enum RoleSource {
+      NAME,
+      EMAIL
+    }
   }
 }
